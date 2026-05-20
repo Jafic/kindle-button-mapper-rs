@@ -23,6 +23,16 @@ fn main() {
 
     // Parse arguments
     let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "kindle-button-mapper {} (build {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_SHA")
+        );
+        return;
+    }
+
     let config_path = if args.len() > 1 {
         &args[1]
     } else {
@@ -38,7 +48,11 @@ fn main() {
         }
     };
 
-    info!("Kindle Button Mapper starting...");
+    info!(
+        "Kindle Button Mapper {} (build {}) starting...",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_SHA")
+    );
     info!("Config: debounce={}ms, long_press={}ms, repeat={}ms, grab={}",
         config.debounce_ms, config.long_press_ms, config.repeat_ms, config.grab);
 
