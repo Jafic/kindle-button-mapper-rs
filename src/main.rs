@@ -1,6 +1,8 @@
 mod config;
 mod input;
 mod mapper;
+mod vkeyboard;
+mod waf_helper;
 
 use config::Config;
 use evdev::InputEventKind;
@@ -21,7 +23,6 @@ fn main() {
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
-    // Parse arguments
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -33,13 +34,26 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--waf-helper") {
+        let cfg = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "config.ini".to_string());
+        if let Err(e) = waf_helper::run(cfg) {
+            error!("WAF helper failed: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     let config_path = if args.len() > 1 {
         &args[1]
     } else {
         "config.ini"
     };
 
-    // Load configuration
     let config = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -53,66 +67,104 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_SHA")
     );
-    info!("Config: debounce={}ms, long_press={}ms, repeat={}ms, grab={}",
-        config.debounce_ms, config.long_press_ms, config.repeat_ms, config.grab);
+    info!(
+        "Config: devices={}, debounce={}ms, long_press={}ms, repeat={}ms",
+        config.devices.len(),
+        config.debounce_ms,
+        config.long_press_ms,
+        config.repeat_ms,
+    );
 
-    // Setup signal handlers
     unsafe {
         signal(Signal::SIGINT, SigHandler::Handler(handle_signal)).ok();
         signal(Signal::SIGTERM, SigHandler::Handler(handle_signal)).ok();
     }
 
-    // Create mapper
+    // Virtual keyboard via uinput — kept alive for the daemon's lifetime.
+    // The path is written to /var/run/kindle-button-mapper-key-target so
+    // scripts/key.sh can inject events into it.
+    let _vkeyboard = vkeyboard::try_init();
+
+    let mut handles = Vec::new();
+    let on_connect = config.on_connect.clone();
+    let on_disconnect = config.on_disconnect.clone();
+    for device in config.devices {
+        let id = device.id.clone();
+        let debounce_ms = config.debounce_ms;
+        let long_press_ms = config.long_press_ms;
+        let repeat_ms = config.repeat_ms;
+        let log_buttons = config.log_buttons;
+        let on_conn = on_connect.clone();
+        let on_disc = on_disconnect.clone();
+        let h = thread::Builder::new()
+            .name(format!("dev:{}", id))
+            .spawn(move || device_worker(device, debounce_ms, long_press_ms, repeat_ms, log_buttons, on_conn, on_disc))
+            .expect("spawn device thread");
+        handles.push(h);
+    }
+
+    if handles.is_empty() {
+        info!("No devices configured — idling. Add a device via the Button Mapper WAF app and restart.");
+        while RUNNING.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(60));
+        }
+    } else {
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    info!("Shutting down...");
+}
+
+fn device_worker(
+    cfg: config::DeviceConfig,
+    debounce_ms: u64,
+    long_press_ms: u64,
+    repeat_ms: u64,
+    log_buttons: bool,
+    on_connect: Option<String>,
+    on_disconnect: Option<String>,
+) {
     let mut mapper = Mapper::new(
-        config.mappings,
-        config.long_press_mappings,
-        config.dpad_mappings,
-        config.dpad_longpress_mappings,
-        config.trigger_mappings,
-        config.trigger_longpress_mappings,
-        config.debounce_ms,
-        config.long_press_ms,
-        config.repeat_ms,
-        config.log_buttons,
+        cfg.mappings,
+        cfg.long_press_mappings,
+        cfg.dpad_mappings,
+        cfg.dpad_longpress_mappings,
+        cfg.trigger_mappings,
+        cfg.trigger_longpress_mappings,
+        debounce_ms,
+        long_press_ms,
+        repeat_ms,
+        log_buttons,
     );
 
-    // Main loop with reconnection
     while RUNNING.load(Ordering::SeqCst) {
-        let handler = InputHandler::new(
-            config.device_name.clone(),
-            config.device_path.clone(),
-            config.grab,
-        );
-
+        let handler = InputHandler::new(cfg.name.clone(), cfg.path.clone(), cfg.grab);
         match handler.open() {
             Ok(mut device) => {
-                info!("Device connected");
-                // Run on_connect script
-                if let Some(ref script) = config.on_connect {
-                    info!("Running on_connect script");
+                info!("[{}] device connected", cfg.id);
+                if let Some(ref script) = on_connect {
+                    info!("[{}] running on_connect script", cfg.id);
                     execute_script(script);
                 }
                 if let Err(e) = run_event_loop(&mut device, &mut mapper) {
-                    error!("Event loop error: {}", e);
-                    // Device disconnected - run on_disconnect script
-                    if let Some(ref script) = config.on_disconnect {
-                        info!("Device disconnected, running on_disconnect script");
+                    error!("[{}] event loop error: {}", cfg.id, e);
+                    if let Some(ref script) = on_disconnect {
+                        info!("[{}] device disconnected, running on_disconnect script", cfg.id);
                         execute_script(script);
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to open device: {}", e);
+                error!("[{}] failed to open device: {}", cfg.id, e);
             }
         }
-
         if RUNNING.load(Ordering::SeqCst) {
-            info!("Reconnecting in 1 second...");
+            info!("[{}] reconnecting in 1 second...", cfg.id);
             thread::sleep(Duration::from_secs(1));
         }
     }
-
-    info!("Shutting down...");
 }
 
 fn run_event_loop(device: &mut evdev::Device, mapper: &mut Mapper) -> Result<(), String> {

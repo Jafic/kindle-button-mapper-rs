@@ -153,6 +153,15 @@ impl InputHandler {
         let mut device = Device::open(path)
             .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
 
+        // Refuse to read from our own virtual keyboard — happens when the
+        // configured gamepad path collides with the uinput node we created.
+        if device.name().unwrap_or("") == "kindle-button-mapper" {
+            return Err(format!(
+                "{} is our virtual keyboard, not an input device",
+                path.display()
+            ));
+        }
+
         if self.grab {
             if let Err(e) = device.grab() {
                 warn!("Cannot grab device: {}, continuing without exclusive access", e);

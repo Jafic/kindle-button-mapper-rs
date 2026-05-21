@@ -99,6 +99,25 @@ logs-recent:
 # Deploy, restart, and follow logs
 deploy-watch: deploy restart logs
 
+# Deploy WAF + helper, gracefully relaunch with fresh JS, no popup
+deploy-waf:
+    -ssh kindle "lipc-set-prop com.lab126.appmgrd start app://com.lab126.booklet.home" 2>/dev/null
+    -ssh kindle "kill \$(cat /tmp/kindle-button-mapper-waf.pid 2>/dev/null) 2>/dev/null"
+    ssh kindle "/usr/sbin/mntroot rw && mkdir -p /mnt/us/kindle-button-mapper/illusion/MapperManager"
+    scp illusion/MapperManager/config.xml illusion/MapperManager/index.html illusion/MapperManager/style.css illusion/MapperManager/script.js kindle:/mnt/us/kindle-button-mapper/illusion/MapperManager/
+    scp illusion/MapperManager.sh illusion/install-waf-app.sh kindle:/mnt/us/kindle-button-mapper/illusion/
+    ssh kindle "chmod +x /mnt/us/kindle-button-mapper/illusion/*.sh"
+    -ssh kindle "rm -rf /var/local/mesquite/com.lzampier.mappermanager" 2>/dev/null
+    ssh kindle "nohup /mnt/us/kindle-button-mapper/kindle-button-mapper --waf-helper /mnt/us/kindle-button-mapper/config.ini </dev/null >/var/log/kindle-button-mapper-waf.log 2>&1 & echo \$! > /tmp/kindle-button-mapper-waf.pid; disown 2>/dev/null; sleep 1"
+    -ssh kindle "pkill -TERM -f mesquite.*mappermanager" 2>/dev/null
+    sleep 2
+    ssh kindle "lipc-set-prop com.lab126.appmgrd start app://com.lzampier.mappermanager"
+    @echo "First-time install: ssh kindle 'sh /mnt/us/kindle-button-mapper/illusion/install-waf-app.sh'"
+
+# Tail the WAF helper log
+logs-waf:
+    ssh kindle "tail -f /var/log/kindle-button-mapper-waf.log"
+
 # List input devices on Kindle
 list-devices:
     ssh kindle "cat /proc/bus/input/devices"
